@@ -161,40 +161,41 @@ static idx_t SqliteMaxThreads(ClientContext &context, const FunctionData *bind_d
 	return row_count / bind_data.rows_per_group.GetIndex();
 }
 
+static bool SqliteClaimNextSlice(const SqliteBindData &bind_data, SqliteLocalState &lstate, SqliteGlobalState &gstate,
+                                 idx_t &rowid_min, idx_t &rowid_max) {
+	lock_guard<mutex> parallel_lock(gstate.lock);
+	if (!bind_data.rows_per_group.IsValid()) {
+		// not doing a parallel scan - scan everything at once
+		if (gstate.position > 0) {
+			return false;
+		}
+		gstate.position = static_cast<idx_t>(-1);
+		lstate.scan_count = 0;
+		return true;
+	}
+	auto max_row_id = bind_data.row_id_info.max_rowid.GetIndex();
+	if (gstate.position >= max_row_id) {
+		return false;
+	}
+	if (lstate.scan_count == 0 && gstate.rows_per_group < max_row_id) {
+		// we scanned no rows in our previous slice - double the rows per group
+		gstate.rows_per_group *= 2;
+	}
+	if (gstate.rows_per_group == 0) {
+		throw InternalException("SqliteParallelStateNext - gstate.rows_per_group not set");
+	}
+	rowid_min = gstate.position;
+	rowid_max = MinValue<idx_t>(max_row_id, rowid_min + gstate.rows_per_group - 1);
+	gstate.position = rowid_max + 1;
+	lstate.scan_count = 0;
+	return true;
+}
+
 static bool SqliteParallelStateNext(ClientContext &context, const SqliteBindData &bind_data, SqliteLocalState &lstate,
                                     SqliteGlobalState &gstate) {
 	idx_t rowid_min = 0;
 	idx_t rowid_max = 0;
-	bool has_next = false;
-	{
-		lock_guard<mutex> parallel_lock(gstate.lock);
-		if (!bind_data.rows_per_group.IsValid()) {
-			// not doing a parallel scan - scan everything at once
-			if (gstate.position > 0) {
-				return false;
-			}
-			gstate.position = static_cast<idx_t>(-1);
-			lstate.scan_count = 0;
-			has_next = true;
-		} else {
-			auto max_row_id = bind_data.row_id_info.max_rowid.GetIndex();
-			if (gstate.position < max_row_id) {
-				if (lstate.scan_count == 0 && gstate.rows_per_group < max_row_id) {
-					// we scanned no rows in our previous slice - double the rows per group
-					gstate.rows_per_group *= 2;
-				}
-				if (gstate.rows_per_group == 0) {
-					throw InternalException("SqliteParallelStateNext - gstate.rows_per_group not set");
-				}
-				rowid_min = gstate.position;
-				rowid_max = MinValue<idx_t>(max_row_id, rowid_min + gstate.rows_per_group - 1);
-				gstate.position = rowid_max + 1;
-				lstate.scan_count = 0;
-				has_next = true;
-			}
-		}
-	}
-	if (!has_next) {
+	if (!SqliteClaimNextSlice(bind_data, lstate, gstate, rowid_min, rowid_max)) {
 		return false;
 	}
 	SqliteInitInternal(context, bind_data, lstate, rowid_min, rowid_max);
