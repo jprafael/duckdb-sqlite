@@ -21,9 +21,9 @@ struct SqliteLocalState : public LocalTableFunctionState {
 	SQLiteDB *db;
 	SQLiteDB owned_db;
 	SQLiteStatement stmt;
+	string stmt_sql;
 	bool done = false;
 	vector<column_t> column_ids;
-	string prepared_sql;
 	//! The amount of rows we scanned as part of this row group
 	idx_t scan_count = 1;
 
@@ -103,10 +103,10 @@ static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<col
 }
 
 static void SqlitePrepareStatement(SqliteLocalState &local_state, const string &sql) {
-	if (!local_state.stmt.IsOpen() || local_state.prepared_sql != sql) {
+	if (!local_state.stmt.IsOpen() || local_state.stmt_sql != sql) {
 		local_state.stmt.Close();
 		local_state.stmt = local_state.db->Prepare(sql.c_str());
-		local_state.prepared_sql = sql;
+		local_state.stmt_sql = sql;
 		return;
 	}
 	local_state.stmt.Reset();
