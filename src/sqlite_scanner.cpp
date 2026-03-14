@@ -124,7 +124,7 @@ static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bin
 		local_state.owned_db = SQLiteDB::Open(bind_data.file_name.c_str(), options);
 		local_state.db = &local_state.owned_db;
 	}
-	auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids);
+	string sql = SqliteGetScanSQL(bind_data, local_state.column_ids);
 	SqlitePrepareStatement(local_state, sql);
 	if (bind_data.rows_per_group.IsValid()) {
 		auto param_idx = bind_data.params.size();
