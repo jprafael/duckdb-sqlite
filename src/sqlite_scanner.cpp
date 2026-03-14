@@ -22,7 +22,6 @@ struct SqliteLocalState : public LocalTableFunctionState {
 	SQLiteDB owned_db;
 	SQLiteStatement stmt;
 	bool done = false;
-	bool reuses_rowid_statement = false;
 	vector<column_t> column_ids;
 	string prepared_sql;
 	//! The amount of rows we scanned as part of this row group
@@ -87,8 +86,7 @@ static unique_ptr<FunctionData> SqliteBind(ClientContext &context, TableFunction
 	return std::move(result);
 }
 
-static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<column_t> &column_ids, bool parameterized_rowid,
-                               idx_t rowid_min, idx_t rowid_max) {
+static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<column_t> &column_ids) {
 	if (!bind_data.sql.empty()) {
 		return bind_data.sql;
 	}
@@ -98,16 +96,23 @@ static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<col
 	});
 
 	auto sql = StringUtil::Format("SELECT %s FROM \"%s\"", col_names, SQLiteUtils::SanitizeIdentifier(bind_data.table_name));
-	if (!bind_data.rows_per_group.IsValid()) {
-		D_ASSERT(rowid_min == 0);
-		return sql;
-	}
-	if (parameterized_rowid) {
+	if (bind_data.rows_per_group.IsValid()) {
 		sql += " WHERE ROWID BETWEEN ? AND ?";
 	} else {
-		sql += StringUtil::Format(" WHERE ROWID BETWEEN %d AND %d", rowid_min, rowid_max);
+		D_ASSERT(bind_data.sql.empty());
 	}
 	return sql;
+}
+
+static void SqlitePrepareStatement(SqliteLocalState &local_state, const string &sql) {
+	if (!local_state.stmt.IsOpen() || local_state.prepared_sql != sql) {
+		local_state.stmt.Close();
+		local_state.stmt = local_state.db->Prepare(sql.c_str());
+		local_state.prepared_sql = sql;
+		return;
+	}
+	local_state.stmt.Reset();
+	local_state.stmt.ClearBindings();
 }
 
 static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bind_data, SqliteLocalState &local_state,
@@ -121,27 +126,12 @@ static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bin
 		local_state.owned_db = SQLiteDB::Open(bind_data.file_name.c_str(), options);
 		local_state.db = &local_state.owned_db;
 	}
-	auto use_reusable_rowid_statement = bind_data.sql.empty() && bind_data.rows_per_group.IsValid();
-	if (use_reusable_rowid_statement) {
-		auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids, true, rowid_min, rowid_max);
-		if (!local_state.stmt.IsOpen() || !local_state.reuses_rowid_statement || local_state.prepared_sql != sql) {
-			local_state.stmt.Close();
-			local_state.stmt = local_state.db->Prepare(sql.c_str());
-			local_state.prepared_sql = sql;
-			local_state.reuses_rowid_statement = true;
-		} else {
-			local_state.stmt.Reset();
-			local_state.stmt.ClearBindings();
-		}
+	auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids);
+	SqlitePrepareStatement(local_state, sql);
+	if (bind_data.rows_per_group.IsValid()) {
 		auto param_idx = bind_data.params.size();
 		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
 		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
-	} else {
-		local_state.reuses_rowid_statement = false;
-		local_state.prepared_sql.clear();
-		local_state.stmt.Close();
-		auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids, false, rowid_min, rowid_max);
-		local_state.stmt = local_state.db->Prepare(sql.c_str());
 	}
 
 	for (idx_t i = 0; i < bind_data.params.size(); i++) {
