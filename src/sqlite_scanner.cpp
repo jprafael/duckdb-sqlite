@@ -98,8 +98,6 @@ static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<col
 	auto sql = StringUtil::Format("SELECT %s FROM \"%s\"", col_names, SQLiteUtils::SanitizeIdentifier(bind_data.table_name));
 	if (bind_data.rows_per_group.IsValid()) {
 		sql += " WHERE ROWID BETWEEN ? AND ?";
-	} else {
-		D_ASSERT(bind_data.sql.empty());
 	}
 	return sql;
 }
