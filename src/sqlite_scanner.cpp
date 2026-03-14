@@ -22,7 +22,9 @@ struct SqliteLocalState : public LocalTableFunctionState {
 	SQLiteDB owned_db;
 	SQLiteStatement stmt;
 	bool done = false;
+	bool reuses_rowid_statement = false;
 	vector<column_t> column_ids;
+	string prepared_sql;
 	//! The amount of rows we scanned as part of this row group
 	idx_t scan_count = 1;
 
@@ -85,44 +87,62 @@ static unique_ptr<FunctionData> SqliteBind(ClientContext &context, TableFunction
 	return std::move(result);
 }
 
+static string SqliteGetScanSQL(const SqliteBindData &bind_data, const vector<column_t> &column_ids, bool parameterized_rowid,
+                               idx_t rowid_min, idx_t rowid_max) {
+	if (!bind_data.sql.empty()) {
+		return bind_data.sql;
+	}
+	auto col_names = StringUtil::Join(column_ids.data(), column_ids.size(), ", ", [&](const idx_t column_id) {
+		return column_id == (column_t)-1 ? "ROWID"
+		                                 : '"' + SQLiteUtils::SanitizeIdentifier(bind_data.names[column_id]) + '"';
+	});
+
+	auto sql = StringUtil::Format("SELECT %s FROM \"%s\"", col_names, SQLiteUtils::SanitizeIdentifier(bind_data.table_name));
+	if (!bind_data.rows_per_group.IsValid()) {
+		D_ASSERT(rowid_min == 0);
+		return sql;
+	}
+	if (parameterized_rowid) {
+		sql += " WHERE ROWID BETWEEN ? AND ?";
+	} else {
+		sql += StringUtil::Format(" WHERE ROWID BETWEEN %d AND %d", rowid_min, rowid_max);
+	}
+	return sql;
+}
+
 static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bind_data, SqliteLocalState &local_state,
                                idx_t rowid_min, idx_t rowid_max) {
 	D_ASSERT(rowid_min <= rowid_max);
 
 	local_state.done = false;
-	// we may have leftover statements or connections from a previous call to this
-	// function
-	local_state.stmt.Close();
 	if (!local_state.db) {
 		SQLiteOpenOptions options;
 		options.access_mode = AccessMode::READ_ONLY;
 		local_state.owned_db = SQLiteDB::Open(bind_data.file_name.c_str(), options);
 		local_state.db = &local_state.owned_db;
 	}
-	string sql;
-	if (bind_data.sql.empty()) {
-		auto col_names = StringUtil::Join(
-		    local_state.column_ids.data(), local_state.column_ids.size(), ", ", [&](const idx_t column_id) {
-			    return column_id == (column_t)-1
-			               ? "ROWID"
-			               : '"' + SQLiteUtils::SanitizeIdentifier(bind_data.names[column_id]) + '"';
-		    });
-
-		sql = StringUtil::Format("SELECT %s FROM \"%s\"", col_names,
-		                         SQLiteUtils::SanitizeIdentifier(bind_data.table_name));
-		if (bind_data.rows_per_group.IsValid()) {
-			// we are scanning a subset of the rows - generate a WHERE clause based on
-			// the rowid
-			auto where_clause = StringUtil::Format(" WHERE ROWID BETWEEN %d AND %d", rowid_min, rowid_max);
-			sql += where_clause;
+	auto use_reusable_rowid_statement = bind_data.sql.empty() && bind_data.rows_per_group.IsValid();
+	if (use_reusable_rowid_statement) {
+		auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids, true, rowid_min, rowid_max);
+		if (!local_state.stmt.IsOpen() || !local_state.reuses_rowid_statement || local_state.prepared_sql != sql) {
+			local_state.stmt.Close();
+			local_state.stmt = local_state.db->Prepare(sql.c_str());
+			local_state.prepared_sql = sql;
+			local_state.reuses_rowid_statement = true;
 		} else {
-			// we are scanning the entire table - no need for a WHERE clause
-			D_ASSERT(rowid_min == 0);
+			local_state.stmt.Reset();
+			local_state.stmt.ClearBindings();
 		}
+		auto param_idx = bind_data.params.size();
+		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
+		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
 	} else {
-		sql = bind_data.sql;
+		local_state.reuses_rowid_statement = false;
+		local_state.prepared_sql.clear();
+		local_state.stmt.Close();
+		auto sql = SqliteGetScanSQL(bind_data, local_state.column_ids, false, rowid_min, rowid_max);
+		local_state.stmt = local_state.db->Prepare(sql.c_str());
 	}
-	local_state.stmt = local_state.db->Prepare(sql.c_str());
 
 	for (idx_t i = 0; i < bind_data.params.size(); i++) {
 		const Value &param = bind_data.params[i];
@@ -155,35 +175,42 @@ static idx_t SqliteMaxThreads(ClientContext &context, const FunctionData *bind_d
 
 static bool SqliteParallelStateNext(ClientContext &context, const SqliteBindData &bind_data, SqliteLocalState &lstate,
                                     SqliteGlobalState &gstate) {
-	lock_guard<mutex> parallel_lock(gstate.lock);
-	if (!bind_data.rows_per_group.IsValid()) {
-		// not doing a parallel scan - scan everything at once
-		if (gstate.position > 0) {
-			// already scanned
-			return false;
+	idx_t rowid_min = 0;
+	idx_t rowid_max = 0;
+	bool has_next = false;
+	{
+		lock_guard<mutex> parallel_lock(gstate.lock);
+		if (!bind_data.rows_per_group.IsValid()) {
+			// not doing a parallel scan - scan everything at once
+			if (gstate.position > 0) {
+				return false;
+			}
+			gstate.position = static_cast<idx_t>(-1);
+			lstate.scan_count = 0;
+			has_next = true;
+		} else {
+			auto max_row_id = bind_data.row_id_info.max_rowid.GetIndex();
+			if (gstate.position < max_row_id) {
+				if (lstate.scan_count == 0 && gstate.rows_per_group < max_row_id) {
+					// we scanned no rows in our previous slice - double the rows per group
+					gstate.rows_per_group *= 2;
+				}
+				if (gstate.rows_per_group == 0) {
+					throw InternalException("SqliteParallelStateNext - gstate.rows_per_group not set");
+				}
+				rowid_min = gstate.position;
+				rowid_max = MinValue<idx_t>(max_row_id, rowid_min + gstate.rows_per_group - 1);
+				gstate.position = rowid_max + 1;
+				lstate.scan_count = 0;
+				has_next = true;
+			}
 		}
-		SqliteInitInternal(context, bind_data, lstate, 0, 0);
-		gstate.position = static_cast<idx_t>(-1);
-		lstate.scan_count = 0;
-		return true;
 	}
-	auto max_row_id = bind_data.row_id_info.max_rowid.GetIndex();
-	if (gstate.position < max_row_id) {
-		if (lstate.scan_count == 0 && gstate.rows_per_group < max_row_id) {
-			// we scanned no rows in our previous slice - double the rows per group
-			gstate.rows_per_group *= 2;
-		}
-		if (gstate.rows_per_group == 0) {
-			throw InternalException("SqliteParallelStateNext - gstate.rows_per_group not set");
-		}
-		auto start = gstate.position;
-		auto end = MinValue<idx_t>(max_row_id, start + gstate.rows_per_group - 1);
-		SqliteInitInternal(context, bind_data, lstate, start, end);
-		gstate.position = end + 1;
-		lstate.scan_count = 0;
-		return true;
+	if (!has_next) {
+		return false;
 	}
-	return false;
+	SqliteInitInternal(context, bind_data, lstate, rowid_min, rowid_max);
+	return true;
 }
 
 static unique_ptr<LocalTableFunctionState>
