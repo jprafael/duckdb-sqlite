@@ -126,15 +126,16 @@ static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bin
 	}
 	string sql = SqliteGetScanSQL(bind_data, local_state.column_ids);
 	SqlitePrepareStatement(local_state, sql);
-	if (bind_data.rows_per_group.IsValid()) {
-		auto param_idx = bind_data.params.size();
-		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
-		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
+
+	idx_t param_idx = 0;
+	for (; param_idx < bind_data.params.size(); param_idx++) {
+		const Value &param = bind_data.params[param_idx];
+		local_state.stmt.BindParameter(param, param_idx);
 	}
 
-	for (idx_t i = 0; i < bind_data.params.size(); i++) {
-		const Value &param = bind_data.params[i];
-		local_state.stmt.BindParameter(param, i);
+	if (bind_data.rows_per_group.IsValid()) {
+		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
+		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
 	}
 }
 
