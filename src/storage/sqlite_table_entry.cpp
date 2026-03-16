@@ -37,7 +37,18 @@ TableFunction SQLiteTableEntry::GetScanFunction(ClientContext &context, unique_p
 	if (!db.GetRowIdInfo(name, result->row_id_info)) {
 		result->rows_per_group = optional_idx();
 	}
-	if (!transaction.IsReadOnly() || sqlite_catalog.InMemory()) {
+
+	bool use_global_db = !transaction.IsReadOnly() || sqlite_catalog.InMemory();
+
+	Value threads_setting;
+	if (!use_global_db && context.TryGetCurrentSetting("threads", threads_setting) && !threads_setting.IsNull()) {
+		auto current_threads = NumericCast<idx_t>(BigIntValue::Get(threads_setting.DefaultCastAs(LogicalType::BIGINT)));
+		if (current_threads <= 1) {
+			use_global_db = true;
+		}
+	}
+
+	if (use_global_db) {
 		// for in-memory databases or if we have transaction-local changes we can
 		// only do a single-threaded scan set up the transaction's connection object
 		// as the global db
